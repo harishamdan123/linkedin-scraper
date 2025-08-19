@@ -8,7 +8,7 @@ app = FastAPI()
 
 class JobReq(BaseModel):
     job_title: str       # e.g. "Data Scientist"
-    easy_apply: bool     # True/False
+    easy_apply: bool     # True/False (filters only)
     location: str        # e.g. "New York"
     max_jobs: int = 50   # e.g. 100
 
@@ -44,7 +44,6 @@ def scrape_once(job_title: str, easy_apply: bool, location: str, max_jobs: int):
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
-        # try to wait for the results list
         try:
             page.wait_for_selector("ul.jobs-search__results-list li", timeout=10_000)
         except PWTimeout:
@@ -53,25 +52,17 @@ def scrape_once(job_title: str, easy_apply: bool, location: str, max_jobs: int):
         stable_loops = 0
         last_count = 0
 
-        # scroll & collect
-        for _ in range(60):  # up to ~60 scroll passes
+        for _ in range(60):
             cards = page.locator("ul.jobs-search__results-list li")
             count = cards.count()
 
             for i in range(count):
                 card = cards.nth(i)
-                # selectors with fallbacks (LinkedIn changes classes often)
-                title = get_text_safe(card.locator("h3.base-search-card__title"))
-                if not title:
-                    title = get_text_safe(card.locator("h3"))
+                title = get_text_safe(card.locator("h3.base-search-card__title")) or get_text_safe(card.locator("h3"))
+                company = get_text_safe(card.locator("h4.base-search-card__subtitle a")) or \
+                          get_text_safe(card.locator("h4.base-search-card__subtitle")) or \
+                          get_text_safe(card.locator("a.hidden-nested-link"))
 
-                company = get_text_safe(card.locator("h4.base-search-card__subtitle a"))
-                if not company:
-                    company = get_text_safe(card.locator("h4.base-search-card__subtitle"))
-                if not company:
-                    company = get_text_safe(card.locator("a.hidden-nested-link"))
-
-                # link to job post on LinkedIn
                 link = None
                 try:
                     link = card.locator("a.base-card__full-link").first.get_attribute("href")
@@ -79,27 +70,68 @@ def scrape_once(job_title: str, easy_apply: bool, location: str, max_jobs: int):
                     try:
                         link = card.locator("a").first.get_attribute("href")
                     except:
-                        link = None
+                        pass
 
                 if link:
-                    link = link.split("?")[0]  # strip tracking
+                    link = link.split("?")[0]
                     if link not in seen:
                         seen.add(link)
-                        results.append({"company": company, "role": title, "link": link})
+
+                        ### NEW: open job page to check Easy Apply vs Company site
+                        job_page = ctx.new_page()
+                        job_page.goto(link, wait_until="domcontentloaded", timeout=30_000)
+
+                        job_type = "Unknown"
+                        company_site = None
+
+                        try:
+                            # If Easy Apply button exists
+                            if job_page.locator("button.jobs-apply-button").is_visible():
+                                job_type = "Easy Apply"
+                            else:
+                                # Try company site apply
+                                job_page.wait_for_selector("a[href*='companyWebsiteApply']", timeout=5000)
+                                company_site_btn = job_page.locator("a[href*='companyWebsiteApply']").first
+                                company_site_btn.click()
+
+                                # handle popup "Continue without sign in"
+                                try:
+                                    job_page.wait_for_selector("button[aria-label*='Continue without']", timeout=5000)
+                                    job_page.locator("button[aria-label*='Continue without']").click()
+                                except:
+                                    pass
+
+                                # after click, new page opens
+                                for popup in ctx.pages:
+                                    if popup != job_page:
+                                        company_site = popup.url
+                                        break
+                                job_type = "Company Site"
+                        except:
+                            pass
+
+                        results.append({
+                            "company": company,
+                            "role": title,
+                            "link": link,
+                            "apply_type": job_type,
+                            "company_site": company_site
+                        })
+
+                        job_page.close()
+
                         if len(results) >= max_jobs:
                             browser.close()
                             return results
 
-            # check if we are stuck
             if len(results) == last_count:
                 stable_loops += 1
             else:
                 stable_loops = 0
                 last_count = len(results)
             if stable_loops >= 4:
-                break  # no more new items visible
+                break
 
-            # gentle scroll
             page.mouse.wheel(0, 2500)
             time.sleep(random.uniform(0.8, 1.8))
 
@@ -109,5 +141,4 @@ def scrape_once(job_title: str, easy_apply: bool, location: str, max_jobs: int):
 @app.post("/scrape")
 def scrape(req: JobReq):
     jobs = scrape_once(req.job_title, req.easy_apply, req.location, req.max_jobs)
-    # If you requested 100 but only 80 exist, you just get 80.
     return {"count": len(jobs), "jobs": jobs}
