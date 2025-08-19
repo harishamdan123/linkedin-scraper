@@ -1,101 +1,105 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional, Dict, List
+from typing import List, Dict, Optional
 from urllib.parse import quote_plus
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-import random, time
+import time, random
 
-app = FastAPI(title="Multi-site Job Scraper")
+app = FastAPI(title="Job Scraper")
+
+# ----- Input model (matches your /docs) -----
+class JobRequest(BaseModel):
+    site: str                 # linkedin | indeed | glassdoor | ziprecruiter | monster
+    apply_type: str           # "easy" or "no_easy_apply"
+    job_title: str
+    location: str
+    limit: int = 20
 
 # ---------- Helpers ----------
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-def get_text_safe(locator) -> str:
+def txt(loc) -> str:
     try:
-        return locator.first.inner_text().strip()
+        return loc.first.inner_text().strip()
     except:
         return ""
 
-def has_text(locator, needle: str) -> bool:
+def has_txt(loc, needle: str) -> bool:
     try:
-        texts = locator.all_inner_texts()
-        return any(needle.lower() in (t or "").lower() for t in texts)
+        return any(needle.lower() in (t or "").lower() for t in loc.all_inner_texts())
     except:
         return False
 
 # ---------- LinkedIn ----------
-def li_build_url(job_title: str, location: str, want_easy: bool) -> str:
+def li_search_url(job_title: str, location: str, want_easy: bool) -> str:
     base = "https://www.linkedin.com/jobs/search/"
     url = f"{base}?keywords={quote_plus(job_title)}&location={quote_plus(location)}"
     if want_easy:
-        url += "&f_AL=true"  # Easy Apply filter (we still verify on page)
+        url += "&f_AL=true"  # Easy Apply filter (we still verify on card)
     return url
 
-def li_find_external_apply(job_page) -> Optional[str]:
-    # Try a few known selectors for "Apply on company website"
-    candidates = [
+def li_external_apply(job_page) -> Optional[str]:
+    # common selectors for "Apply on company website"
+    for sel in [
         "a[data-control-name='jobdetails_topcard_inapply']",
         "a[href*='offsiteapply']",
         "a:has-text('Apply on company website')",
         "a:has-text('Apply on company site')",
-    ]
-    for sel in candidates:
+    ]:
         try:
-            link = job_page.locator(sel).first.get_attribute("href")
-            if link:
-                return link
+            href = job_page.locator(sel).first.get_attribute("href")
+            if href:
+                return href
         except:
             pass
     return None
 
 def scrape_linkedin(job_title: str, location: str, limit: int, apply_type: str) -> List[Dict]:
-    """
-    apply_type:
-      - 'easy'    -> ONLY Easy Apply; return LinkedIn job link
-      - 'company' -> ONLY non-Easy Apply; return external company apply link
-    """
     want_easy = (apply_type == "easy")
-    url = li_build_url(job_title, location, want_easy)
+    url = li_search_url(job_title, location, want_easy)
 
-    results: List[Dict] = []
+    rows: List[Dict] = []
     seen = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
         ctx = browser.new_context(user_agent=UA, viewport={"width": 1366, "height": 900})
-        page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        ctx.set_default_navigation_timeout(120_000)
+        ctx.set_default_timeout(60_000)
 
+        page = ctx.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+        page.wait_for_timeout(1500)
         try:
-            page.wait_for_selector("ul.jobs-search__results-list li", timeout=10_000)
+            page.wait_for_selector("ul.jobs-search__results-list li", timeout=20_000)
         except PWTimeout:
             pass
 
-        last_count = 0
-        stable_loops = 0
+        last = 0
+        stable = 0
 
-        for _ in range(60):  # up to ~60 scroll passes
+        for _ in range(60):  # ~60 scroll passes
             cards = page.locator("ul.jobs-search__results-list li")
-            count = cards.count()
+            cnt = cards.count()
 
-            for i in range(count):
+            for i in range(cnt):
                 card = cards.nth(i)
 
-                # detect Easy Apply badge on the card
-                is_easy = has_text(card.locator("span"), "Easy Apply")
-
-                # filter by apply_type
+                # check Easy Apply badge
+                is_easy = has_txt(card.locator("span"), "Easy Apply")
                 if want_easy and not is_easy:
                     continue
-                if not want_easy and is_easy:
+                if (not want_easy) and is_easy:
                     continue
 
-                role = (get_text_safe(card.locator("h3.base-search-card__title"))
-                        or get_text_safe(card.locator("h3")))
-                company = (get_text_safe(card.locator("h4.base-search-card__subtitle a"))
-                           or get_text_safe(card.locator("h4.base-search-card__subtitle"))
-                           or get_text_safe(card.locator("a.hidden-nested-link")))
+                role = txt(card.locator("h3.base-search-card__title")) or txt(card.locator("h3"))
+                company = (txt(card.locator("h4.base-search-card__subtitle a"))
+                           or txt(card.locator("h4.base-search-card__subtitle"))
+                           or txt(card.locator("a.hidden-nested-link")))
 
                 job_link = None
                 try:
@@ -105,45 +109,43 @@ def scrape_linkedin(job_title: str, location: str, limit: int, apply_type: str) 
                         job_link = card.locator("a").first.get_attribute("href")
                     except:
                         job_link = None
-
                 if not job_link:
                     continue
-
                 job_link = job_link.split("?")[0]
                 if job_link in seen:
                     continue
                 seen.add(job_link)
 
                 if want_easy:
-                    # Return LinkedIn job page where Easy Apply is present
-                    results.append({"company": company, "role": role, "link": job_link})
+                    # return LinkedIn job page (with Easy Apply)
+                    rows.append({"role": role, "company_name": company, "link": job_link})
                 else:
-                    # Open job page and extract the company-site apply link
-                    apply_link = None
+                    # open job page → get external company apply URL
+                    apply_url = None
                     try:
-                        job_page = ctx.new_page()
-                        job_page.goto(job_link, wait_until="domcontentloaded", timeout=30_000)
-                        job_page.wait_for_timeout(1200)
-                        apply_link = li_find_external_apply(job_page)
-                        job_page.close()
+                        jp = ctx.new_page()
+                        jp.goto(job_link, wait_until="domcontentloaded", timeout=60_000)
+                        jp.wait_for_timeout(1200)
+                        apply_url = li_external_apply(jp)
+                        jp.close()
                     except:
-                        apply_link = None
+                        apply_url = None
 
-                    if apply_link:
-                        results.append({"company": company, "role": role, "link": apply_link})
-                    # If no external link, skip (you asked for ONLY company-apply here)
+                    if apply_url:
+                        rows.append({"role": role, "company_name": company, "link": apply_url})
+                    # if no external link, skip (only-no-easy-apply requested)
 
-                if len(results) >= limit:
+                if len(rows) >= limit:
                     browser.close()
-                    return results
+                    return rows
 
-            # if we stop discovering new items, exit
-            if len(results) == last_count:
-                stable_loops += 1
+            # stop if not finding new ones
+            if len(rows) == last:
+                stable += 1
             else:
-                stable_loops = 0
-                last_count = len(results)
-            if stable_loops >= 4:
+                stable = 0
+                last = len(rows)
+            if stable >= 4:
                 break
 
             # gentle scroll
@@ -151,45 +153,45 @@ def scrape_linkedin(job_title: str, location: str, limit: int, apply_type: str) 
             time.sleep(random.uniform(0.8, 1.8))
 
         browser.close()
-    return results
+    return rows
 
-# ---------- Other sites: stubs (to be wired with login/cookies) ----------
-def scrape_indeed(job_title: str, location: str, limit: int, apply_type: str) -> List[Dict]:
-    return [{"note": "Indeed login/captcha flow pending. Will return Smart Apply or company apply links accordingly."}]
+# ---------- Other sites (placeholders to fill later) ----------
+def scrape_indeed(*args, **kwargs):
+    return [{"note":"Indeed login/captcha flow to be added (Smart Apply vs company apply)"}]
 
-def scrape_glassdoor(job_title: str, location: str, limit: int, apply_type: str) -> List[Dict]:
-    return [{"note": "Glassdoor login pending. Will return EasyApplySender or employer-site links accordingly."}]
+def scrape_glassdoor(*args, **kwargs):
+    return [{"note":"Glassdoor login flow to be added (EasyApplySender vs employer site)"}]
 
-def scrape_zip(job_title: str, location: str, limit: int, apply_type: str) -> List[Dict]:
-    return [{"note": "ZipRecruiter flow pending. Will return 1-Click Apply or employer-site links."}]
+def scrape_zip(*args, **kwargs):
+    return [{"note":"ZipRecruiter flow to be added (1-Click vs employer site)"}]
 
-def scrape_monster(job_title: str, location: str, limit: int, apply_type: str) -> List[Dict]:
-    return [{"note": "Monster flow pending. Will return Easy Apply or employer-site links."}]
+def scrape_monster(*args, **kwargs):
+    return [{"note":"Monster flow to be added (Easy Apply vs employer site)"}]
 
-# ---------- API models ----------
-class ScrapeReq(BaseModel):
-    platform: str          # linkedin | indeed | glassdoor | ziprecruiter | monster
-    apply_type: str        # easy | company
-    job_title: str
-    location: str
-    max_jobs: int = 50
+# ---------- API ----------
+@app.post("/scrape")
+def scrape(req: JobRequest):
+    site = req.site.lower().strip()
+    apply_type = req.apply_type.lower().strip()
 
-def run_scrape(q: ScrapeReq) -> Dict:
-    plat = q.platform.lower().strip()
-    apply_type = q.apply_type.lower().strip()
+    if site not in {"linkedin","indeed","glassdoor","ziprecruiter","monster"}:
+        return {"error":"site must be one of: linkedin, indeed, glassdoor, ziprecruiter, monster"}
+    if apply_type not in {"easy","no_easy_apply"}:
+        return {"error":"apply_type must be 'easy' or 'no_easy_apply'"}
 
-    if plat not in {"linkedin", "indeed", "glassdoor", "ziprecruiter", "monster"}:
-        return {"error": "platform must be one of: linkedin, indeed, glassdoor, ziprecruiter, monster"}
-    if apply_type not in {"easy", "company"}:
-        return {"error": "apply_type must be 'easy' or 'company'"}
+    if site == "linkedin":
+        jobs = scrape_linkedin(req.job_title, req.location, req.limit, apply_type)
+    elif site == "indeed":
+        jobs = scrape_indeed(req.job_title, req.location, req.limit, apply_type)
+    elif site == "glassdoor":
+        jobs = scrape_glassdoor(req.job_title, req.location, req.limit, apply_type)
+    elif site == "ziprecruiter":
+        jobs = scrape_zip(req.job_title, req.location, req.limit, apply_type)
+    else:
+        jobs = scrape_monster(req.job_title, req.location, req.limit, apply_type)
 
-    if plat == "linkedin":
-        jobs = scrape_linkedin(q.job_title, q.location, q.max_jobs, apply_type)
-    elif plat == "indeed":
-        jobs = scrape_indeed(q.job_title, q.location, q.max_jobs, apply_type)
-    elif plat == "glassdoor":
-        jobs = scrape_glassdoor(q.job_title, q.location, q.max_jobs, apply_type)
-    elif plat == "ziprecruiter":
-        jobs = scrape_zip(q.job_title, q.location, q.max_jobs, apply_type)
-    else:  # monster
-        j
+    return {"count": len(jobs), "jobs": jobs}
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
