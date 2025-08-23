@@ -1,144 +1,120 @@
-from fastapi import FastAPI
+import re
+import time
+from typing import Optional
+
+from fastapi import FastAPI, Body
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-from urllib.parse import quote_plus
-import random, time
 
-app = FastAPI()
+app = FastAPI(title="Transcribe.mov helper")
 
-class JobReq(BaseModel):
-    job_title: str       # e.g. "Data Scientist"
-    easy_apply: bool     # True/False (filters only)
-    location: str        # e.g. "New York"
-    max_jobs: int = 50   # e.g. 100
+class TranscribeReq(BaseModel):
+    url: str                          # media URL to paste
+    max_wait_sec: int = 600           # max time to wait for completion (default 10 min)
 
-def build_url(job_title: str, location: str, easy_apply: bool) -> str:
-    url = (
-        "https://www.linkedin.com/jobs/search/"
-        f"?keywords={quote_plus(job_title)}"
-        f"&location={quote_plus(location)}"
-    )
-    if easy_apply:
-        url += "&f_AL=true"  # Easy Apply filter
-    return url
+def _get_transcript_text(page) -> Optional[str]:
+    """
+    Try a few selectors to pull the final transcript block.
+    Returns the text or None.
+    """
+    candidate_selectors = [
+        # common “content” containers
+        "div.prose",
+        "div[class*='prose']",
+        "div[class*='transcript']",
+        "div[id*='transcript']",
+        "article",
+        # many sites place readable content under <main>
+        "main",
+        # fallback to container that holds lots of paragraphs
+        "div.content, div.container, div.markdown"
+    ]
+    for sel in candidate_selectors:
+        try:
+            el = page.query_selector(sel)
+            if not el:
+                continue
+            txt = el.inner_text().strip()
+            # sanity-check: at least a few words
+            if txt and len(txt.split()) > 8:
+                return txt
+        except Exception:
+            continue
 
-def get_text_safe(locator):
+    # last fallback: collect visible paragraphs
     try:
-        return locator.first.inner_text().strip()
-    except:
-        return ""
+        paras = page.query_selector_all("main p, article p, div p")
+        txt = "\n\n".join([p.inner_text().strip() for p in paras if p.inner_text().strip()])
+        return txt if len(txt.split()) > 8 else None
+    except Exception:
+        return None
 
-def scrape_once(job_title: str, easy_apply: bool, location: str, max_jobs: int):
-    url = build_url(job_title, location, easy_apply)
-    results = []
-    seen = set()
-
+@app.post("/transcribe")
+def transcribe(req: TranscribeReq = Body(...)):
+    """
+    1) open app.transcribe.mov
+    2) paste URL in the 'Download from anywhere' input
+    3) click Submit
+    4) wait for /transcript/... page and completion
+    5) return transcript text
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"),
-            viewport={"width": 1366, "height": 900},
-        )
-        page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        context = browser.new_context()
+        page = context.new_page()
 
+        # STEP 1: Open the app
+        page.goto("https://app.transcribe.mov/", wait_until="load")
+
+        # STEP 2: Paste URL into the lower input (placeholder shows https://)
+        # The input is the "Download from anywhere" box
+        page.fill('input[placeholder^="https://"]', req.url)
+
+        # STEP 3: Click the "Submit" button near that input
+        # (target by button text)
+        page.click("button:has-text('Submit')")
+
+        # STEP 4: Wait to land on the result route /transcript/<id>
         try:
-            page.wait_for_selector("ul.jobs-search__results-list li", timeout=10_000)
+            page.wait_for_url(re.compile(r"/transcript/"), timeout=120_000)  # 120s
         except PWTimeout:
-            pass
+            browser.close()
+            return {
+                "status": "error",
+                "message": "Did not navigate to /transcript/ page (maybe bad link or rate limit)."
+            }
 
-        stable_loops = 0
-        last_count = 0
+        # You’ll often see an interim page with “Started”
+        # We don’t need to do anything except wait for completion or content.
+        deadline = time.time() + req.max_wait_sec
+        transcript_text: Optional[str] = None
 
-        for _ in range(60):
-            cards = page.locator("ul.jobs-search__results-list li")
-            count = cards.count()
+        # Poll for completion text OR for transcript content to appear
+        while time.time() < deadline and not transcript_text:
+            try:
+                # prefer explicit completion signal if present
+                page.wait_for_selector("text=Transcription completed", timeout=5_000)
+            except PWTimeout:
+                pass  # it's okay; keep polling
 
-            for i in range(count):
-                card = cards.nth(i)
-                title = get_text_safe(card.locator("h3.base-search-card__title")) or get_text_safe(card.locator("h3"))
-                company = get_text_safe(card.locator("h4.base-search-card__subtitle a")) or \
-                          get_text_safe(card.locator("h4.base-search-card__subtitle")) or \
-                          get_text_safe(card.locator("a.hidden-nested-link"))
-
-                link = None
-                try:
-                    link = card.locator("a.base-card__full-link").first.get_attribute("href")
-                except:
-                    try:
-                        link = card.locator("a").first.get_attribute("href")
-                    except:
-                        pass
-
-                if link:
-                    link = link.split("?")[0]
-                    if link not in seen:
-                        seen.add(link)
-
-                        ### NEW: open job page to check Easy Apply vs Company site
-                        job_page = ctx.new_page()
-                        job_page.goto(link, wait_until="domcontentloaded", timeout=30_000)
-
-                        job_type = "Unknown"
-                        company_site = None
-
-                        try:
-                            # If Easy Apply button exists
-                            if job_page.locator("button.jobs-apply-button").is_visible():
-                                job_type = "Easy Apply"
-                            else:
-                                # Try company site apply
-                                job_page.wait_for_selector("a[href*='companyWebsiteApply']", timeout=5000)
-                                company_site_btn = job_page.locator("a[href*='companyWebsiteApply']").first
-                                company_site_btn.click()
-
-                                # handle popup "Continue without sign in"
-                                try:
-                                    job_page.wait_for_selector("button[aria-label*='Continue without']", timeout=5000)
-                                    job_page.locator("button[aria-label*='Continue without']").click()
-                                except:
-                                    pass
-
-                                # after click, new page opens
-                                for popup in ctx.pages:
-                                    if popup != job_page:
-                                        company_site = popup.url
-                                        break
-                                job_type = "Company Site"
-                        except:
-                            pass
-
-                        results.append({
-                            "company": company,
-                            "role": title,
-                            "link": link,
-                            "apply_type": job_type,
-                            "company_site": company_site
-                        })
-
-                        job_page.close()
-
-                        if len(results) >= max_jobs:
-                            browser.close()
-                            return results
-
-            if len(results) == last_count:
-                stable_loops += 1
-            else:
-                stable_loops = 0
-                last_count = len(results)
-            if stable_loops >= 4:
+            # Try to grab transcript text on every loop
+            transcript_text = _get_transcript_text(page)
+            if transcript_text:
                 break
 
-            page.mouse.wheel(0, 2500)
-            time.sleep(random.uniform(0.8, 1.8))
+            # small idle wait between polls
+            page.wait_for_timeout(1500)
 
         browser.close()
-    return results
 
-@app.post("/scrape")
-def scrape(req: JobReq):
-    jobs = scrape_once(req.job_title, req.easy_apply, req.location, req.max_jobs)
-    return {"count": len(jobs), "jobs": jobs}
+        if not transcript_text:
+            return {
+                "status": "error",
+                "message": "Timed out waiting for transcript. Try increasing max_wait_sec or verify the link."
+            }
+
+        return {
+            "status": "ok",
+            "source_url": req.url,
+            "transcript": transcript_text
+        }
